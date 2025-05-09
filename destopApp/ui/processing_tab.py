@@ -1,0 +1,627 @@
+import os
+import csv
+import cv2
+import numpy as np
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
+    QPushButton, QLabel, QFileDialog, QProgressBar,
+    QMessageBox, QSizePolicy, QApplication  # Added QApplication
+)
+from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtCore import Qt, Signal, QThread, QObject
+import utils
+import model
+
+class OMRProcessor(QObject):
+    """
+    Optimized OMR processing worker that handles batch processing of answer sheets
+    Features:
+    - Thread-safe operation
+    - Progress reporting
+    - Error handling
+    - Memory-efficient processing
+    """
+    
+    # Signals for communication with main thread
+    progress_updated = Signal(int, str)  # progress_percent, status_message
+    image_processed = Signal(str, list, np.ndarray)  # filename, answers, marked_image
+    processing_complete = Signal()
+    error_occurred = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, image_paths, project_path):
+        super().__init__()
+        self.image_paths = image_paths
+        self.project_path = project_path
+        self._cancel_requested = False
+        self.widthImg = 1025  # Standard OMR sheet width
+        self.heightImg = 760  # Standard OMR sheet height
+        self.batch_size = 50  # Process images in batches to manage memory
+        self.dummy_answer = [0] * 50  # Placeholder for dummy answers
+
+    def process_all(self):
+        """Process all images with accurate progress tracking"""
+        try:
+            total_images = len(self.image_paths)
+            processed_count = 0
+            
+            for image_path in self.image_paths:
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    break
+                
+                filename = os.path.basename(image_path)
+                
+                try:
+                    # Load image
+                    image = cv2.imread(image_path)
+                    if image is None:
+                        raise ValueError(f"Failed to load image: {filename}")
+                    
+                    # Process image
+                    answers, final_img = self.process_omr_sheet(image)
+                    
+                    # Emit progress after completion (not before)
+                    processed_count += 1
+                    progress = int((processed_count / total_images) * 100)
+                    self.progress_updated.emit(
+                        progress, 
+                        f"Processed {filename} ({processed_count}/{total_images})"
+                    )
+                    
+                    # Emit results
+                    self.image_processed.emit(filename, answers, final_img)
+                    
+                except Exception as e:
+                    self.error_occurred.emit(f"Skipped {filename}: {str(e)}")
+                    continue
+            
+            if not self._cancel_requested:
+                self.processing_complete.emit()
+        
+        except Exception as e:
+            self.error_occurred.emit(f"Fatal processing error: {str(e)}")
+    def process_omr_sheet(self, image):
+        """
+        Process a single OMR sheet with optimized operations
+        Returns:
+        - answers: List of detected answers (1-based index)
+        - marked_image: Image with marked answers
+        """
+        # Step 1: Preprocessing with optimized operations
+        img = cv2.resize(image, (self.widthImg, self.heightImg))
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 1)
+        edges = cv2.Canny(blur, 10, 50)
+        
+        if self._cancel_requested:
+            raise RuntimeError("Processing cancelled")
+
+        # Step 2: Contour Detection with area filtering
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        rects = utils.rectContour(contours)
+        
+        if not rects:
+            return self.dummy_answer, img
+
+        # Step 3: Perspective Transform with error checking
+        biggest = utils.getCornerPoints(rects[0])
+        if biggest.size == 0:
+            return self.dummy_answer, img
+            
+        biggest = utils.reorder(biggest)
+        pts1 = np.float32(biggest)
+        pts2 = np.float32([[0, 0], [self.widthImg, 0], [0, self.heightImg], [self.widthImg, self.heightImg]])
+        matrix = cv2.getPerspectiveTransform(pts1, pts2)
+        warped = cv2.warpPerspective(img, matrix, (self.widthImg, self.heightImg))
+
+        # Step 4: Adaptive Thresholding for better robustness
+        warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        thresh = cv2.threshold(warped_gray, 170, 255, cv2.THRESH_BINARY_INV)[1]
+
+        totalPixelSize =cv2.countNonZero(thresh)
+        print("Total Pixel Size: ",totalPixelSize)
+
+        if self._cancel_requested:
+            raise RuntimeError("Processing cancelled")
+
+        # Step 1: Split into boxes
+        boxes = utils.verticalSplitBoxes(thresh)
+        answers = []
+
+        # Step 2: For each question box
+        for box in boxes:
+            if self._cancel_requested:
+                raise RuntimeError("Processing cancelled")
+
+            # Get answer bubbles (skip unwanted blocks)
+            answer_blocks = utils.getAnswerBlocks(box)[2:6]  # Adjust if needed
+
+            # Step 3: Collect non-empty blocks for batch processing
+            valid_blocks = [(j, block) for j, block in enumerate(answer_blocks) if cv2.countNonZero(block) > 0]
+
+            if valid_blocks:
+                indices, blocks = zip(*valid_blocks)  # unzip indices and images
+
+                # Step 4: Batch classify
+                predictions = model.classify_batch(list(blocks))  # returns list of (label, confidence)
+
+                # Step 5: Get crossed bubble index (if only one)
+                marked = []
+                for idx, (label, _) in zip(indices, predictions):
+                    if label == "Crossed_Bubble":
+                        marked.append(idx + 2)  # 1-based index since we skipped first 2 blocks
+
+                answers.append(marked[0] if len(marked) == 1 else -1)
+            else:
+                answers.append(-1)  # No valid bubbles
+
+        # Step 6: Generate Results with optimized drawing
+        drawing = np.zeros_like(warped)
+        drawing = utils.showAnswers(drawing, answers)
+        
+        inv_matrix = cv2.getPerspectiveTransform(pts2, pts1)
+        inv_drawing = cv2.warpPerspective(drawing, inv_matrix, (img.shape[1], img.shape[0]))
+        final_img = cv2.addWeighted(img, 1, inv_drawing, 1, 0)
+
+        return answers, final_img
+
+    def cancel(self):
+        """Request cancellation of current processing"""
+        self._cancel_requested = True
+
+
+class ProcessingTab(QWidget):
+    """
+    Optimized Processing Tab for handling large batches of OMR sheets
+    Features:
+    - Memory-efficient image handling
+    - Batch processing
+    - Progress tracking
+    - Error recovery
+    """
+    
+    # Processing signals
+    processing_complete = Signal(object, object, object)
+    processing_cancelled = Signal()
+    processing_started = Signal()
+    processing_finished = Signal()
+    
+    def __init__(self):
+        super().__init__()
+        self.project_path = None
+        self.image_paths = []
+        self.current_index = 0
+        self.processed_images = {}  # Stores only paths to processed images
+        self.current_answers = {}  # Stores answers for CSV output
+        self.setup_ui()
+        self.setup_connections()
+        
+        # Initialize UI state
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.lbl_image_info.setText("0/0 images loaded")
+        self.update_navigation_buttons()
+
+    def setup_ui(self):
+        """Initialize all UI components with optimized layouts"""
+        self.layout = QVBoxLayout()
+        self.layout.setContentsMargins(10, 10, 10, 10)
+
+        # Project Selection Group
+        project_group = QGroupBox("Project Selection")
+        project_layout = QHBoxLayout()
+        self.btn_select_project = QPushButton("Select Project")
+        self.btn_select_project.setStyleSheet("font-weight: bold;")
+        self.lbl_project = QLabel("No project selected")
+        project_layout.addWidget(self.btn_select_project)
+        project_layout.addWidget(self.lbl_project)
+        project_group.setLayout(project_layout)
+
+        # Image Navigation Group
+        nav_group = QGroupBox("Image Navigation")
+        nav_layout = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Previous")
+        self.btn_next = QPushButton("Next ▶")
+        self.lbl_image_info = QLabel("0/0 images loaded")
+        nav_layout.addWidget(self.btn_prev)
+        nav_layout.addWidget(self.lbl_image_info)
+        nav_layout.addWidget(self.btn_next)
+        nav_group.setLayout(nav_layout)
+
+        # Image Display with optimized settings
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet("""
+            border: 1px solid gray; 
+            min-height: 400px;
+            background-color: #f0f0f0;
+        """)
+        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        # Processing Controls with batch options
+        control_group = QGroupBox("Batch Processing")
+        control_layout = QVBoxLayout()
+        self.btn_process_all = QPushButton("Mark All Images")
+        self.btn_process_all.setStyleSheet("""
+            background-color: #4CAF50; 
+            color: white;
+            padding: 8px;
+            font-weight: bold;
+        """)
+        self.btn_cancel = QPushButton("Cancel Processing")
+        self.btn_cancel.setStyleSheet("""
+            background-color: #f44336; 
+            color: white;
+            padding: 8px;
+        """)
+        self.btn_cancel.setEnabled(False)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(True)
+        
+        self.lbl_status = QLabel("Ready")
+        self.lbl_status.setStyleSheet("font-weight: bold;")
+        
+        control_layout.addWidget(self.btn_process_all)
+        control_layout.addWidget(self.btn_cancel)
+        control_layout.addWidget(self.progress_bar)
+        control_layout.addWidget(self.lbl_status)
+        control_group.setLayout(control_layout)
+
+        # Assemble main layout
+        self.layout.addWidget(project_group)
+        self.layout.addWidget(nav_group)
+        self.layout.addWidget(self.image_label)
+        self.layout.addWidget(control_group)
+        self.setLayout(self.layout)
+
+    def setup_connections(self):
+        """Connect all signals and slots"""
+        self.btn_select_project.clicked.connect(self.select_project)
+        self.btn_prev.clicked.connect(self.show_previous_image)
+        self.btn_next.clicked.connect(self.show_next_image)
+        self.btn_process_all.clicked.connect(self.start_processing)
+        self.btn_cancel.clicked.connect(self.cancel_processing)
+
+    def select_project(self):
+        """Let user select a project folder with validation"""
+        project_path = QFileDialog.getExistingDirectory(
+            self, 
+            "Select Project Folder",
+            "",
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        if project_path:
+            self.load_project(project_path)
+
+    def load_project(self, project_path):
+        """Load project with optimized file handling"""
+        self.project_path = project_path
+        self.lbl_project.setText(os.path.basename(project_path))
+        self.image_paths = []
+        self.processed_images.clear()
+        self.current_answers.clear()
+        
+        # Load images with error handling
+        try:
+            # Load from original_images folder
+            images_dir = os.path.join(project_path, "original_images")
+            if os.path.exists(images_dir):
+                self.image_paths.extend([
+                    os.path.join(images_dir, f) 
+                    for f in sorted(os.listdir(images_dir))
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
+                ])
+            
+            # Load linked images from references file
+            ref_file = os.path.join(project_path, "image_references.txt")
+            if os.path.exists(ref_file):
+                with open(ref_file, 'r') as f:
+                    self.image_paths.extend([
+                        line.strip() 
+                        for line in f 
+                        if line.strip() and os.path.exists(line.strip())
+                    ])
+        
+        except Exception as e:
+            QMessageBox.warning(self, "Load Error", f"Error loading project: {str(e)}")
+        
+        # Update UI
+        if self.image_paths:
+            self.current_index = 0
+            self.show_current_image()
+        else:
+            self.lbl_image_info.setText("No valid images found")
+        
+        self.update_navigation_buttons()
+
+    def show_current_image(self):
+        """Display current image with lazy loading"""
+        if not self.image_paths:
+            self.image_label.clear()
+            self.lbl_image_info.setText("No images loaded")
+            return
+        
+        try:
+            image_path = self.image_paths[self.current_index]
+            filename = os.path.basename(image_path)
+            
+            # Check for processed version (load from disk only when needed)
+            if filename in self.processed_images:
+                marked_path = self.processed_images[filename]
+                image = cv2.imread(marked_path)
+                status_prefix = "Processed "
+            else:
+                image = cv2.imread(image_path)
+                status_prefix = "Original "
+                
+            if image is None:
+                raise ValueError("Failed to read image")
+            
+            # Convert and display with optimized scaling
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            
+            # Create QImage without unnecessary copies
+            q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            
+            # Scale to fit while maintaining aspect ratio
+            scaled_pixmap = pixmap.scaled(
+                self.image_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            
+            self.image_label.setPixmap(scaled_pixmap)
+            self.lbl_image_info.setText(
+                f"{status_prefix}Image {self.current_index + 1}/{len(self.image_paths)}\n"
+                f"{filename}"
+            )
+            
+        except Exception as e:
+            print(f"Image display error: {str(e)}")
+            self.image_label.setText(f"Error: {str(e)}")
+            self.lbl_image_info.setText("Image display error")
+
+    def show_next_image(self):
+        """Navigate to next image with bounds checking"""
+        if self.current_index < len(self.image_paths) - 1:
+            self.current_index += 1
+            self.show_current_image()
+
+    def show_previous_image(self):
+        """Navigate to previous image with bounds checking"""
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.show_current_image()
+            
+    def update_navigation_buttons(self):
+        """Update button states based on current position"""
+        has_images = len(self.image_paths) > 0
+        self.btn_prev.setEnabled(has_images and self.current_index > 0)
+        self.btn_next.setEnabled(has_images and self.current_index < len(self.image_paths) - 1)
+        self.btn_process_all.setEnabled(has_images)
+
+    def start_processing(self):
+        """Start optimized batch processing"""
+        if not self.image_paths or not self.project_path:
+            QMessageBox.warning(self, "Error", "No project or images loaded")
+            return
+        try:
+            # Initialize results directory
+            results_dir = os.path.join(self.project_path, "results")
+            os.makedirs(results_dir, exist_ok=True)
+            
+            # Initialize CSV file
+            csv_path = os.path.join(results_dir, "answers.csv")
+            with open(csv_path, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["Filename"] + [f"Q{i+1}" for i in range(50)])
+            
+            # Reset processing state
+            self.processed_images.clear()
+            self.current_answers.clear()
+            
+            # Setup worker thread with lower priority
+            self.processing_started.emit()
+            self.btn_process_all.setEnabled(False)
+            self.btn_cancel.setEnabled(True)
+            self.progress_bar.setValue(0)
+            self.lbl_status.setText("Initializing batch processing...")
+            QApplication.processEvents()  # Ensure UI updates
+            
+            self.worker_thread = QThread()
+            self.worker_thread.setPriority(QThread.LowPriority)
+            self.omr_processor = OMRProcessor(self.image_paths, self.project_path)
+            self.omr_processor.moveToThread(self.worker_thread)
+            
+            # Connect signals
+            self.worker_thread.started.connect(self.omr_processor.process_all)
+            self.omr_processor.progress_updated.connect(self.update_progress)
+            self.omr_processor.image_processed.connect(self.save_image_results)
+            self.omr_processor.processing_complete.connect(self.finish_processing)
+            self.omr_processor.error_occurred.connect(self.handle_processing_error)
+            self.omr_processor.cancelled.connect(self.cancel_processing)
+            
+            # Cleanup connections
+            self.omr_processor.processing_complete.connect(self.worker_thread.quit)
+            self.omr_processor.error_occurred.connect(self.worker_thread.quit)
+            self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+            
+            # Start processing
+            self.worker_thread.start()
+        except Exception as e:
+            QMessageBox.critical(self, "Processing Error", f"Error starting processing: {str(e)}")
+            return
+
+    def update_progress(self, progress, message):
+        """Throttled progress updates"""
+        # Only update if progress increased or it's a completion message
+        if progress > self.progress_bar.value() or progress == 100:
+            self.progress_bar.setValue(progress)
+            self.lbl_status.setText(message)
+            
+            # Process events at certain intervals (every 5% or completion)
+            if progress % 5 == 0 or progress == 100:
+                QApplication.processEvents()  # Ensure UI remains responsive
+
+
+
+
+    def save_image_results(self, filename, answers, marked_image):
+        """Save results immediately after each image is processed"""
+        if not self.project_path or marked_image is None:
+            return
+            
+        results_dir = os.path.join(self.project_path, "results")
+        
+        try:
+            # 1. Ensure directory exists
+            os.makedirs(results_dir, exist_ok=True)
+            
+            # 2. Save marked image
+            output_path = os.path.join(results_dir, f"marked_{filename}")
+            cv2.imwrite(output_path, marked_image)
+            
+            # 3. Save answers to CSV immediately
+            csv_path = os.path.join(results_dir, "answers.csv")
+            file_exists = os.path.exists(csv_path)
+            
+            with open(csv_path, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                if not file_exists:
+                    writer.writerow(["Filename"] + [f"Q{i+1}" for i in range(len(answers))])
+                
+                # Convert answers to 1-based index (0 for unanswered)
+                corrected_answers = [ans-1 if ans != -1 else 0 for ans in answers]
+                writer.writerow([filename] + corrected_answers)
+            
+            # 4. Update UI
+            self.display_marked_image(marked_image)
+            if self.current_index < len(self.image_paths) - 1:
+                self.current_index += 1
+            self.update_navigation_buttons()
+            
+        except Exception as e:
+            self.handle_processing_error(f"Error saving {filename}: {str(e)}")
+    def display_marked_image(self, marked_image):
+        """Display marked image with optimized rendering"""
+        try:
+            # Convert color space
+            rgb_image = cv2.cvtColor(marked_image, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            
+            # Create QImage
+            q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            
+            # Scale to fit
+            scaled_pixmap = pixmap.scaled(
+                self.image_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            
+            self.image_label.setPixmap(scaled_pixmap)
+            self.lbl_image_info.setText(
+                f"Processed Image {self.current_index + 1}/{len(self.image_paths)}\n"
+                f"Marked results displayed"
+            )
+            
+        except Exception as e:
+            print(f"Marked image display error: {str(e)}")
+            self.image_label.setText(f"Error displaying results")
+
+    def finish_processing(self):
+        """Verify all images were processed"""
+        processed_count = len(self.processed_images)
+        total_count = len(self.image_paths)
+        
+        if processed_count < total_count:
+            self.lbl_status.setText(
+                f"Completed {processed_count}/{total_count} images"
+            )
+        else:
+            self.lbl_status.setText("Processing completed successfully!")
+        
+        self.progress_bar.setValue(100)
+        self.btn_process_all.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        
+        QMessageBox.information(
+            self,
+            "Processing Complete",
+            f"Processed {processed_count}/{total_count} images\n"
+            f"Results saved to: {os.path.join(self.project_path, 'results')}"
+        )
+
+    def cancel_processing(self):
+        """Handle processing cancellation"""
+        if hasattr(self, 'omr_processor'):
+            self.omr_processor.cancel()
+        
+        # Save any processed data before cancelling
+        self.save_answers_to_csv()
+        
+        # Update UI
+        self.btn_process_all.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.lbl_status.setText("Processing cancelled")
+        self.progress_bar.setValue(0)
+        
+        self.processing_cancelled.emit()
+
+    def handle_processing_error(self, error_msg):
+        """Handle processing errors with user feedback"""
+        self.btn_process_all.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.lbl_status.setText(f"Error: {error_msg}")
+        self.progress_bar.setValue(0)
+        
+        # Show error message but don't block processing
+        QMessageBox.critical(self, "Processing Error", error_msg)
+
+    def resizeEvent(self, event):
+        """Handle window resize to maintain image display"""
+        super().resizeEvent(event)
+        if hasattr(self, 'image_label') and self.image_paths:
+            self.show_current_image()
+
+    def set_image_paths(self, image_paths):
+        """
+        Set the image paths to process
+        Args:
+            image_paths: List of paths to images
+        """
+        # Validate input
+        if not isinstance(image_paths, list):
+            raise TypeError("image_paths must be a list")
+        if not all(isinstance(p, (str, os.PathLike)) for p in image_paths):
+            raise TypeError("All paths must be strings or PathLike objects")
+        
+        # Store paths and reset state
+        self.image_paths = [os.path.normpath(str(p)) for p in image_paths]  # Normalize paths
+        self.current_index = 0
+        self.processed_images = {}
+        
+        # Update UI
+        if self.image_paths:
+            self.show_current_image()
+        else:
+            self.image_label.clear()
+            self.lbl_image_info.setText("No images loaded")
+        
+        self.update_navigation_buttons()
+        self.btn_process_all.setEnabled(len(self.image_paths) > 0)
+
+    def closeEvent(self, event):
+        """Clean up resources when closing"""
+        if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
+            self.cancel_processing()
+            self.worker_thread.quit()
+            self.worker_thread.wait(1000)  # Wait up to 1 second
+        event.accept()

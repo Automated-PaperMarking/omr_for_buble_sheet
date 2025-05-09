@@ -5,7 +5,7 @@ import os
 import model
 
 #constants
-path ='test_11.jpeg'
+path ='test_16.jpeg'
 widhtImg = 1025
 hightImg = 760
 webCamFeed = True
@@ -33,6 +33,14 @@ try:
     #find rectangle contours
     rectCon =utils.rectContour(contours)
     biggestContour = utils.getCornerPoints(rectCon[0])
+    # secondBiggestContour = utils.getCornerPoints(rectCon[1])
+    
+    # #print(secoundbiggestContour)
+    # if len(rectCon) >= 2:
+    #     secondBiggestContour = utils.getCornerPoints(rectCon[1])
+    #     text, extractedImg = utils.extract_text_from_box(img, secondBiggestContour)
+    #     print("Text from second largest box:", text)
+    #     cv2.imshow("Second Largest Box", extractedImg)
 
     #print(biggestContour)
     if biggestContour.size !=0:
@@ -46,7 +54,7 @@ try:
         
         #Apply threshold
         imgWarpGray=cv2.cvtColor(imgWarpColored,cv2.COLOR_BGR2GRAY)
-        imgThresh=cv2.threshold(imgWarpGray,170,255,cv2.THRESH_BINARY_INV)[1]
+        imgThresh=imgWarpGray
 
         #get answers boxes
         boxes =utils.verticalSplitBoxes(imgThresh)
@@ -69,7 +77,7 @@ try:
                 if cv2.countNonZero(answerBoxes[j]) > 0:
                     label, confidence = model.classify_bubble(answerBoxes[j])
                     answerWithModels.append({"box_index": i+1, "answer": j+2, "label": label})
-                    if label=="Crossed_Bubble" or label=="Cross_Removed_Bubble":
+                    if label=="Crossed_Bubble":
                         answerLabels.append(j+2)
                         
             #if answerlabels have only one crossed bubble then add the index of the crossed bubble
